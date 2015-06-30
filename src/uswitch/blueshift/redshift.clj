@@ -12,6 +12,7 @@
   (:import [java.util UUID]
            [java.sql DriverManager SQLException]))
 
+(def manifest-folder "blueshift-staging/")
 
 (defn manifest [bucket files]
   {:entries (for [f files] {:url (str "s3://" bucket "/" f)
@@ -21,7 +22,7 @@
   "Uploads the manifest to S3 as JSON, returns the URL to the uploaded object.
    Manifest should be generated with uswitch.blueshift.redshift/manifest."
   [credentials bucket manifest]
-  (let [file-name (str (UUID/randomUUID) ".manifest")
+  (let [file-name (str manifest-folder (UUID/randomUUID) ".manifest")
         s3-url (str "s3://" bucket "/" file-name)]
     (put-object credentials bucket file-name (generate-string manifest))
     {:key file-name
@@ -135,12 +136,19 @@
 (defn merge-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
   (let [staging-table (str table "_staging")]
     (mark! redshift-imports)
-    (with-connection jdbc-url
-      (execute (create-staging-table-stmt table staging-table)
-               (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
-               (delete-target-stmt table staging-table pk-columns)
-               (insert-from-staging-stmt table staging-table table-manifest)
-               (drop-table-stmt staging-table)))))
+    (if (:direct-table-copy table-manifest)
+      (with-connection jdbc-url
+        (execute  (copy-from-s3-stmt table redshift-manifest-url credentials table-manifest))
+      )
+      (with-connection jdbc-url
+         (execute (create-staging-table-stmt table staging-table)
+                  (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
+                  (append-from-staging-stmt table staging-table pk-columns)
+                  (drop-table-stmt staging-table))
+      )
+    )
+  )
+)
 
 (defn replace-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
   (mark! redshift-imports)
@@ -149,16 +157,24 @@
              (copy-from-s3-stmt table redshift-manifest-url credentials table-manifest))))
 
 (defn append-table [credentials redshift-manifest-url {:keys [table jdbc-url pk-columns strategy] :as table-manifest}]
-  (let [staging-table (str table "_staging")]
+  (let [staging-table (str table "_staging")]    
     (mark! redshift-imports)
-    (with-connection jdbc-url
-      (execute (create-staging-table-stmt table staging-table)
-               (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
-               (append-from-staging-stmt table staging-table pk-columns)
-               (drop-table-stmt staging-table)))))
+    (if (:direct-table-copy table-manifest)
+      (with-connection jdbc-url
+        (execute  (copy-from-s3-stmt table redshift-manifest-url credentials table-manifest))
+      )
+      (with-connection jdbc-url
+         (execute (create-staging-table-stmt table staging-table)
+                  (copy-from-s3-stmt staging-table redshift-manifest-url credentials table-manifest)
+                  (append-from-staging-stmt table staging-table pk-columns)
+                  (drop-table-stmt staging-table))
+      )
+    )
+  )
+)
 
 (defn load-table [credentials redshift-manifest-url {strategy :strategy :as table-manifest}]
-  (case (keyword strategy)
-    :merge (merge-table credentials redshift-manifest-url table-manifest)
-    :replace (replace-table credentials redshift-manifest-url table-manifest)
-    :append (append-table credentials redshift-manifest-url table-manifest)))
+   (case (keyword strategy)
+      :merge (merge-table credentials redshift-manifest-url table-manifest)
+      :replace (replace-table credentials redshift-manifest-url table-manifest)
+      :append (append-table credentials redshift-manifest-url table-manifest)))

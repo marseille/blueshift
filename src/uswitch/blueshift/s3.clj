@@ -1,7 +1,7 @@
 (ns uswitch.blueshift.s3
   (:require [com.stuartsierra.component :refer (Lifecycle system-map using start stop)]
             [clojure.tools.logging :refer (info error warn debug errorf)]
-            [aws.sdk.s3 :refer (list-objects get-object delete-object)]
+            [aws.sdk.s3 :refer (list-objects get-object delete-object put-object copy-object)]
             [clojure.set :refer (difference)]
             [clojure.core.async :refer (go-loop thread put! chan >!! <!! >! <! alts!! timeout close!)]
             [clojure.edn :as edn]
@@ -22,7 +22,14 @@
                      :strategy       s/Str
                      :options        s/Any
                      :staging-select (s/maybe (s/either s/Str s/Keyword))
-                     :data-pattern   s/Regex})
+                     :data-pattern   s/Regex
+                     (s/optional-key :rename-prefix) s/Str
+                     (s/optional-key :rename-suffix) s/Str
+                     (s/optional-key :rename-files) s/Bool
+                     (s/optional-key :direct-table-copy) s/Bool
+                     })
+
+(def errors-folder "processed-errors/")
 
 (defn validate [manifest]
   (when-let [error-info (s/check ManifestSchema manifest)]
@@ -79,12 +86,28 @@
             (assoc-if-nil :strategy "merge")
             (update-in [:data-pattern] re-pattern))))))
 
+(defn- get-filename-of-S3-file
+  [file]
+  (if (.contains file ".")
+    (subs file 0 (.lastIndexOf file "."))
+    file
+  )
+)
+
+(defn- get-path-of-S3-file
+  [file]
+  (if (.contains file "/")
+    (subs file 0 (+ 1 (.lastIndexOf file "/")))
+    ""
+  )
+)
+
 (defn- step-scan
   [credentials bucket directory]
   (try
     (let [fs (files credentials bucket directory)]
-      (if-let [manifest (manifest credentials bucket fs)]
-        (do
+      (if-let [manifest (manifest credentials bucket fs)]        
+        (do        
           (validate manifest)
           (let [data-files  (filter (fn [{:keys [key]}]
                                       (re-matches (:data-pattern manifest) key))
@@ -119,61 +142,95 @@
     (inc! importing-files (count files))
     (try (time! import-timer
                 (redshift/load-table credentials url table-manifest))
-         (info "Successfully imported" (count files) "files")
+         (info "Successfully imported" (count files) "files")         
+         
+         ;;deletes the manifest created
          (delete-object credentials bucket key)
-         (dec! importing-files (count files))
-         {:state :delete
-          :files files}
+         (dec! importing-files (count files))                          
+
+         ;;if rename-files = true in manifest config
+         (if (:rename-files table-manifest) 
+             {:state :move :files files :table-manifest table-manifest}
+             {:state :delete :files files})
+
+         
          (catch java.sql.SQLException e
            (error e "Error loading into" (:table table-manifest))
            (error (:table table-manifest) "Redshift manifest content:" redshift-manifest)
+           
+           ;;comment these three lines if testing and want same file re-processed.           
            (delete-object credentials bucket key)
            (dec! importing-files (count files))
-           {:state :scan
-            :pause? true}))))
+  
+           ;;if rename-files = true in manifest config
+           (if (:rename-files table-manifest) 
+               {:state :move :files files :table-manifest table-manifest :error true}
+               {:state :delete :files files})))))
 
 (defn- step-delete
   [credentials bucket files]
   (do
     (doseq [key files]
       (info "Deleting" (str "s3://" bucket "/" key))
-      (try
+      (try                
         (delete-object credentials bucket key)
         (catch Exception e
           (warn "Couldn't delete" key "  - ignoring"))))
-    {:state :scan, :pause? true}))
+    {:state :scan, :pause? true}))    
+
+(defn- step-move  
+  "optional renaming of a processed csv file, options are 
+   rename-prefix and rename-suffix specified in the manifest.edn"
+  [credentials bucket manifest files error]  
+  (do
+    ;;both rename-prefix rename-suffix = nil means file will be deleted after rename
+    ;;since step-delete runs after rename
+    (doseq [key files]
+      (let [
+            path (get-path-of-S3-file key)            
+            filename (get-filename-of-S3-file (clojure.string/replace key path ""))
+            rename-prefix (or (:rename-prefix manifest) path)
+            rename-suffix (or (:rename-suffix manifest) (subs key (.lastIndexOf key ".")))            
+            new-filename  (if error (str errors-folder filename rename-suffix) (str rename-prefix filename rename-suffix))
+            ]
+        (info "Renaming" "s3://" bucket "/" key  " to " "s3://" bucket new-filename)
+        (try
+          (copy-object credentials bucket key new-filename)
+          (delete-object credentials bucket key)
+        (catch Exception e 
+          (error e "Error renaming file:" key)
+        ))
+      )      
+    )
+    {:state :scan, :pause? true}
+  )
+)
 
 (defn- progress
   [{:keys [state] :as world}
    {:keys [credentials bucket directory] :as configuration}]
+  
   (case state
     :scan   (step-scan   credentials bucket directory )
-    :load   (step-load   credentials bucket           (:table-manifest world) (:files world))
-    :delete (step-delete credentials bucket           (:files world))))
+    :load   (step-load   credentials bucket                 (:table-manifest world) (:files world))    
+    :delete (step-delete credentials bucket                 (:files world))
+    :move (step-move credentials bucket                 (:table-manifest world) (:files world) (:error world))
+  ))
 
-(defrecord KeyWatcher [credentials bucket directory
-                       poll-interval-seconds
-                       poll-interval-random-seconds]
+(defrecord KeyWatcher [credentials bucket directory poll-interval-seconds]
   Lifecycle
   (start [this]
     (info "Starting KeyWatcher for" (str bucket "/" directory) "polling every" poll-interval-seconds "seconds")
     (let [control-ch    (chan)
           configuration {:credentials credentials :bucket bucket :directory directory}]
       (thread
-       (loop [timer (timeout (*
-                              (+ poll-interval-seconds
-                                 (int (* (rand) (float poll-interval-random-seconds))))
-                              1000))
+       (loop [timer (timeout (* poll-interval-seconds 1000))
               world {:state :scan}]
          (let [next-world (progress world configuration)]
            (if (:pause? next-world)
              (let [[_ c] (alts!! [control-ch timer])]
                (when (not= c control-ch)
-                 (let [t (*
-                          (+ poll-interval-seconds
-                             (int (* (rand) (float poll-interval-random-seconds))))
-                          1000)]
-                   (recur (timeout t) next-world))))
+                 (recur (timeout (* poll-interval-seconds 1000)) next-world)))
              (recur timer next-world)))))
       (assoc this :watcher-control-ch control-ch)))
   (stop [this]
@@ -181,17 +238,12 @@
     (close-channels this :watcher-control-ch)))
 
 
-(defn spawn-key-watcher! [credentials bucket directory
-                          poll-interval-seconds poll-interval-random-seconds]
-  (start (KeyWatcher. credentials bucket directory
-                      poll-interval-seconds
-                      poll-interval-random-seconds)))
+(defn spawn-key-watcher! [credentials bucket directory poll-interval-seconds]
+  (start (KeyWatcher. credentials bucket directory poll-interval-seconds)))
 
 (def directories-watched (counter [(str *ns*) "directories-watched" "directories"]))
 
-(defrecord KeyWatcherSpawner [bucket-watcher
-                              poll-interval-seconds
-                              poll-interval-random-seconds]
+(defrecord KeyWatcherSpawner [bucket-watcher poll-interval-seconds]
   Lifecycle
   (start [this]
     (info "Starting KeyWatcherSpawner")
@@ -200,10 +252,7 @@
       (go-loop [dirs (<! new-directories-ch)]
         (when dirs
           (doseq [dir dirs]
-            (swap! watchers conj (spawn-key-watcher!
-                                  credentials bucket dir
-                                  poll-interval-seconds
-                                  poll-interval-random-seconds))
+            (swap! watchers conj (spawn-key-watcher! credentials bucket dir poll-interval-seconds))
             (inc! directories-watched))
           (recur (<! new-directories-ch))))
       (assoc this :watchers watchers)))
@@ -217,9 +266,7 @@
     (clear-keys this :watchers)))
 
 (defn key-watcher-spawner [config]
-  (map->KeyWatcherSpawner
-   {:poll-interval-seconds (-> config :s3 :poll-interval :seconds)
-    :poll-interval-random-seconds (or (-> config :s3 :poll-interval :random-seconds) 0)}))
+  (map->KeyWatcherSpawner {:poll-interval-seconds (-> config :s3 :poll-interval :seconds)}))
 
 (defn matching-directories [credentials bucket key-pattern]
   (try (->> (leaf-directories credentials bucket)
